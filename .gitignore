@@ -13,6 +13,7 @@ build/
 
 # Virtual environment
 .venv/
+.venv-poc/
 venv/
 ENV/
 
@@ -64,6 +65,7 @@ logs/
 # PyQt6 WebEngine cache
 QtWebEngine/
 
-# Temp
+# Temp / editor backups
 *.tmp
 *.bak
+*~

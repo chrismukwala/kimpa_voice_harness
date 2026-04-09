@@ -219,13 +219,19 @@ def step_validate():
             fail(f"{name} — {r.stderr.strip()[:120]}")
             results.append((name, False))
 
-    # Ollama connectivity
-    r = run(["curl", "-s", "http://localhost:11434"], check=False, capture=True)
-    if r.returncode == 0 and "Ollama" in r.stdout:
-        ok("Ollama API reachable at localhost:11434")
-        results.append(("Ollama API", True))
-    else:
-        fail("Ollama API not reachable — is 'ollama serve' running?")
+    # Ollama connectivity (pure Python — no curl dependency)
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://localhost:11434", timeout=5) as resp:
+            body = resp.read().decode()
+        if "Ollama" in body:
+            ok("Ollama API reachable at localhost:11434")
+            results.append(("Ollama API", True))
+        else:
+            fail("Ollama API responded but unexpected body — is this Ollama?")
+            results.append(("Ollama API", False))
+    except Exception as e:
+        fail(f"Ollama API not reachable — is 'ollama serve' running? ({e})")
         results.append(("Ollama API", False))
 
     # espeak-ng runtime check
