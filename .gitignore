@@ -1,0 +1,69 @@
+# Voice Harness — .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets — NEVER commit these
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*_secret*
+*_password*
+*_token*
+secrets.yaml
+secrets.json
+credentials.json
+config.local.*
+
+# Ollama / model caches
+*.gguf
+*.ggml
+*.bin
+
+# Monaco build artefacts (keep the extracted min/ folder, not the tarball)
+assets/monaco/*.tgz
+assets/monaco/node_modules/
+assets/monaco/package.json
+assets/monaco/package-lock.json
+
+# Logs
+*.log
+logs/
+
+# PyQt6 WebEngine cache
+QtWebEngine/
+
+# Temp
+*.tmp
+*.bak

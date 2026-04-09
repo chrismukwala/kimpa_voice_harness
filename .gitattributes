@@ -1,0 +1,17 @@
+# Voice Harness — .gitattributes
+# Force LF line endings for all text files.
+# This is REQUIRED: CRLF on Windows will break SEARCH/REPLACE string matching.
+* text=auto eol=lf
+
+# Binary files — no line-ending conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.tgz binary
+*.zip binary
+*.pyc binary
