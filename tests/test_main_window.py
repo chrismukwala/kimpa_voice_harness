@@ -626,3 +626,51 @@ class TestTtsNavWiring:
 
         mock_stop.assert_called_once()
         assert win._ai_panel._status.text() == "Listening"
+
+    def test_tts_chunk_incremental_appends_to_navigator(self, qapp, coordinator):
+        """tts_chunk_ready signal should append chunks incrementally."""
+        win = MainWindow(coordinator)
+        assert win._tts_nav.chunk_count == 0
+
+        with patch.object(win._tts_nav, "play_current"):
+            coordinator.tts_chunk_ready.emit("Hello.", b"wav1")
+
+        assert win._tts_nav.chunk_count == 1
+
+    def test_tts_chunk_incremental_autoplays_on_first(self, qapp, coordinator):
+        """First incremental chunk should trigger playback."""
+        win = MainWindow(coordinator)
+
+        with patch.object(win._tts_nav, "play_current") as mock_play:
+            coordinator.tts_chunk_ready.emit("Hello.", b"wav1")
+
+        mock_play.assert_called_once()
+
+    def test_tts_chunk_incremental_does_not_replay_on_subsequent(self, qapp, coordinator):
+        """Second chunk should not restart playback."""
+        win = MainWindow(coordinator)
+
+        with patch.object(win._tts_nav, "play_current") as mock_play:
+            coordinator.tts_chunk_ready.emit("Hello.", b"wav1")
+            assert mock_play.call_count == 1
+
+            # Second chunk should not trigger another play call.
+            coordinator.tts_chunk_ready.emit("World.", b"wav2")
+            assert mock_play.call_count == 1
+
+    def test_tts_chunks_ready_does_not_reload_when_already_populated(self, qapp, coordinator):
+        """Batch signal should not overwrite chunks already loaded incrementally."""
+        win = MainWindow(coordinator)
+
+        with patch.object(win._tts_nav, "play_current"):
+            coordinator.tts_chunk_ready.emit("Hello.", b"wav1")
+            coordinator.tts_chunk_ready.emit("World.", b"wav2")
+
+        # Batch signal arrives at the end — should not call load() since
+        # navigator already has chunks.
+        batch = [("Hello.", b"wav1"), ("World.", b"wav2")]
+        with patch.object(win._tts_nav, "load") as mock_load:
+            coordinator.tts_chunks_ready.emit(batch)
+            mock_load.assert_not_called()
+
+        assert win._tts_nav.chunk_count == 2

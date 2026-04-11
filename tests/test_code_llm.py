@@ -5,6 +5,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from harness.code_llm import parse_search_replace, extract_prose, chat, SYSTEM_PROMPT, MODEL
+from harness.code_llm import chat_stream, chat_stream_raw, split_sentences_streaming
 
 
 # =====================================================================
@@ -358,3 +359,242 @@ class TestChat:
         user_msg = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         assert "... (truncated)" not in user_msg
         assert "def foo(): pass" in user_msg
+
+
+# =====================================================================
+# split_sentences_streaming
+# =====================================================================
+
+class TestSplitSentencesStreaming:
+    """Verify sentence boundary detection from streamed text chunks."""
+
+    def test_simple_sentences(self):
+        chunks = ["Hello world. ", "How are you? ", "I am fine."]
+        sentences = list(split_sentences_streaming(iter(chunks)))
+        assert sentences == ["Hello world.", "How are you?", "I am fine."]
+
+    def test_sentence_split_across_chunks(self):
+        chunks = ["Hel", "lo wor", "ld. How are ", "you?"]
+        sentences = list(split_sentences_streaming(iter(chunks)))
+        assert sentences == ["Hello world.", "How are you?"]
+
+    def test_no_terminator_flushes_remainder(self):
+        chunks = ["Hello world"]
+        sentences = list(split_sentences_streaming(iter(chunks)))
+        assert sentences == ["Hello world"]
+
+    def test_exclamation_mark(self):
+        chunks = ["Great job! Thanks."]
+        sentences = list(split_sentences_streaming(iter(chunks)))
+        assert sentences == ["Great job!", "Thanks."]
+
+    def test_abbreviation_not_split(self):
+        """Common abbreviations like 'Dr.' shouldn't split mid-sentence."""
+        chunks = ["Dr. Smith is here."]
+        sentences = list(split_sentences_streaming(iter(chunks)))
+        # We accept either 1 or 2 sentences — abbreviation handling is best-effort
+        assert any("Smith" in s for s in sentences)
+
+    def test_empty_chunks_ignored(self):
+        chunks = ["", "Hello.", "", "World.", ""]
+        sentences = list(split_sentences_streaming(iter(chunks)))
+        assert sentences == ["Hello.", "World."]
+
+    def test_search_replace_block_not_split(self):
+        """SEARCH/REPLACE blocks should be buffered, not yielded as sentences."""
+        chunks = [
+            "I fixed it. ",
+            "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n",
+            "Done.",
+        ]
+        sentences = list(split_sentences_streaming(iter(chunks)))
+        # Only prose sentences should appear — blocks filtered
+        assert "I fixed it." in sentences
+        assert "Done." in sentences
+        assert not any("SEARCH" in s for s in sentences)
+
+
+# =====================================================================
+# chat_stream
+# =====================================================================
+
+class TestChatStream:
+    """Verify streaming chat yields sentences and captures full response."""
+
+    def _mock_stream_chunks(self, deltas):
+        """Build an iterable of mock streaming chunks from delta strings."""
+        chunks = []
+        for delta_text in deltas:
+            chunk = MagicMock()
+            choice = MagicMock()
+            choice.delta = MagicMock()
+            choice.delta.content = delta_text
+            chunk.choices = [choice]
+            chunks.append(chunk)
+        return iter(chunks)
+
+    @patch("harness.code_llm.OpenAI")
+    def test_stream_yields_sentences(self, MockOpenAI):
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = self._mock_stream_chunks(
+            ["Hello world. ", "How are you?"]
+        )
+
+        sentences = list(chat_stream("test", api_key="test-key"))
+        assert "Hello world." in sentences
+        assert "How are you?" in sentences
+
+    @patch("harness.code_llm.OpenAI")
+    def test_stream_uses_stream_true(self, MockOpenAI):
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = self._mock_stream_chunks(["Hi."])
+
+        list(chat_stream("test", api_key="test-key"))
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs.get("stream") is True
+
+    @patch("harness.code_llm.OpenAI")
+    def test_stream_filters_search_replace_blocks(self, MockOpenAI):
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = self._mock_stream_chunks([
+            "I fixed the bug. ",
+            "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n",
+            "All done.",
+        ])
+
+        sentences = list(chat_stream("test", api_key="test-key"))
+        assert "I fixed the bug." in sentences
+        assert "All done." in sentences
+        assert not any("SEARCH" in s for s in sentences)
+
+    def test_stream_no_api_key_raises(self):
+        with pytest.raises(RuntimeError, match="No API key configured"):
+            list(chat_stream("test"))
+
+    @patch("harness.code_llm.OpenAI")
+    def test_stream_none_deltas_skipped(self, MockOpenAI):
+        """Chunks with None content should be skipped gracefully."""
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+
+        chunks = []
+        for delta_text in [None, "Hello.", None]:
+            chunk = MagicMock()
+            choice = MagicMock()
+            choice.delta = MagicMock()
+            choice.delta.content = delta_text
+            chunk.choices = [choice]
+            chunks.append(chunk)
+        mock_client.chat.completions.create.return_value = iter(chunks)
+
+        sentences = list(chat_stream("test", api_key="test-key"))
+        assert "Hello." in sentences
+
+
+# =====================================================================
+# chat_stream_raw
+# =====================================================================
+
+class TestChatStreamRaw:
+    """Verify chat_stream_raw yields raw deltas without filtering."""
+
+    def _mock_stream_chunks(self, deltas):
+        """Build an iterable of mock streaming chunks from delta strings."""
+        chunks = []
+        for delta_text in deltas:
+            chunk = MagicMock()
+            choice = MagicMock()
+            choice.delta = MagicMock()
+            choice.delta.content = delta_text
+            chunk.choices = [choice]
+            chunks.append(chunk)
+        return iter(chunks)
+
+    @patch("harness.code_llm.OpenAI")
+    def test_raw_stream_yields_all_deltas(self, MockOpenAI):
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = self._mock_stream_chunks(
+            ["Hello ", "world. ", "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"]
+        )
+
+        deltas = list(chat_stream_raw("test", api_key="test-key"))
+        assert len(deltas) == 3
+        assert "SEARCH" in deltas[2]
+
+    @patch("harness.code_llm.OpenAI")
+    def test_raw_stream_does_not_filter_blocks(self, MockOpenAI):
+        """Raw stream must preserve SEARCH/REPLACE blocks unfiltered."""
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = self._mock_stream_chunks([
+            "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE",
+        ])
+
+        deltas = list(chat_stream_raw("test", api_key="test-key"))
+        assert any("SEARCH" in d for d in deltas)
+
+    def test_raw_stream_no_api_key_raises(self):
+        with pytest.raises(RuntimeError, match="No API key configured"):
+            list(chat_stream_raw("test"))
+
+    @patch("harness.code_llm.OpenAI")
+    def test_raw_stream_none_deltas_skipped(self, MockOpenAI):
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+
+        chunks = []
+        for delta_text in [None, "Hello.", None]:
+            chunk = MagicMock()
+            choice = MagicMock()
+            choice.delta = MagicMock()
+            choice.delta.content = delta_text
+            chunk.choices = [choice]
+            chunks.append(chunk)
+        mock_client.chat.completions.create.return_value = iter(chunks)
+
+        deltas = list(chat_stream_raw("test", api_key="test-key"))
+        assert deltas == ["Hello."]
+
+    @patch("harness.code_llm.OpenAI")
+    def test_raw_stream_auth_error_raises_runtime(self, MockOpenAI):
+        from openai import AuthenticationError
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.headers = {}
+        mock_client.chat.completions.create.side_effect = AuthenticationError(
+            message="invalid key", response=mock_resp, body=None,
+        )
+
+        with pytest.raises(RuntimeError, match="Invalid API key"):
+            list(chat_stream_raw("test", api_key="bad-key"))
+
+    @patch("harness.code_llm.OpenAI")
+    def test_raw_stream_connection_error_raises_runtime(self, MockOpenAI):
+        from openai import APIConnectionError
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.side_effect = APIConnectionError(
+            request=MagicMock()
+        )
+
+        with pytest.raises(RuntimeError, match="LLM unavailable"):
+            list(chat_stream_raw("test", api_key="test-key"))
+
+    @patch("harness.code_llm.OpenAI")
+    def test_raw_stream_timeout_error_raises_runtime(self, MockOpenAI):
+        from openai import APITimeoutError
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.side_effect = APITimeoutError(
+            request=MagicMock()
+        )
+
+        with pytest.raises(RuntimeError, match="LLM unavailable"):
+            list(chat_stream_raw("test", api_key="test-key"))

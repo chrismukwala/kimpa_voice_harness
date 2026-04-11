@@ -111,3 +111,68 @@ class TestPlayWavBytes:
 
         mock_sd.play.assert_called_once()
         mock_sd.wait.assert_called_once()
+
+
+# =====================================================================
+# speak_stream (Phase 5 streaming TTS)
+# =====================================================================
+
+class TestSpeakStream:
+    """Verify speak_stream() yields (sentence, wav_bytes) from an iterator."""
+
+    @patch("harness.tts._pipeline", None)
+    @patch("harness.tts.KPipeline", create=True)
+    def test_speak_stream_yields_incrementally(self, _mock_kpipeline_cls):
+        """speak_stream should yield one chunk per sentence from the iterator."""
+        mock_pipeline = MagicMock()
+        _mock_kpipeline_cls.return_value = mock_pipeline
+
+        fake_audio = np.zeros(2400, dtype=np.float32)
+        mock_pipeline.side_effect = lambda text, voice: iter([(0, 0, fake_audio)])
+
+        with patch.dict("sys.modules", {"kokoro": MagicMock(KPipeline=_mock_kpipeline_cls)}):
+            from harness.tts import speak_stream
+            sentences = iter(["Hello.", "World."])
+            results = list(speak_stream(sentences))
+
+        assert len(results) == 2
+        for sentence, wav_data in results:
+            assert isinstance(sentence, str)
+            assert isinstance(wav_data, bytes)
+
+    @patch("harness.tts._pipeline", None)
+    @patch("harness.tts.KPipeline", create=True)
+    def test_speak_stream_empty_iterator(self, _mock_kpipeline_cls):
+        with patch.dict("sys.modules", {"kokoro": MagicMock(KPipeline=_mock_kpipeline_cls)}):
+            from harness.tts import speak_stream
+            results = list(speak_stream(iter([])))
+        assert results == []
+
+    @patch("harness.tts._pipeline", None)
+    @patch("harness.tts.KPipeline", create=True)
+    def test_speak_stream_skips_empty_sentences(self, _mock_kpipeline_cls):
+        mock_pipeline = MagicMock()
+        _mock_kpipeline_cls.return_value = mock_pipeline
+
+        fake_audio = np.zeros(2400, dtype=np.float32)
+        mock_pipeline.side_effect = lambda text, voice: iter([(0, 0, fake_audio)])
+
+        with patch.dict("sys.modules", {"kokoro": MagicMock(KPipeline=_mock_kpipeline_cls)}):
+            from harness.tts import speak_stream
+            sentences = iter(["Hello.", "", "  "])
+            results = list(speak_stream(sentences))
+
+        assert len(results) == 1
+        assert results[0][0] == "Hello."
+
+
+# =====================================================================
+# GPU device configuration (Phase 5)
+# =====================================================================
+
+class TestTTSDevice:
+    """Verify Kokoro can be configured for GPU execution."""
+
+    def test_default_device_is_gpu(self):
+        from harness.tts import TTS_DEVICE
+        assert TTS_DEVICE == "cuda"

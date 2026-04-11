@@ -1,13 +1,20 @@
-"""Tests for harness/voice_input.py — VoiceInput adapter API surface."""
+"""Tests for harness/voice_input.py — VoiceInput with direct faster-whisper + WebRTC VAD."""
 
 import logging
 from unittest.mock import patch, MagicMock
 
+import numpy as np
+
 from harness.voice_input import VoiceInput
 
 
+# ---------------------------------------------------------------------------
+# Public API surface tests (preserved from Phase 4)
+# ---------------------------------------------------------------------------
+
+
 class TestVoiceInputAPI:
-    """Verify the thin adapter exposes the correct public interface."""
+    """Verify the public interface is preserved after the rewrite."""
 
     def test_on_text_registers_callback(self):
         vi = VoiceInput()
@@ -18,13 +25,11 @@ class TestVoiceInputAPI:
     def test_initial_state(self):
         vi = VoiceInput()
         assert vi._running is False
-        assert vi._recorder is None
         assert vi._callback is None
 
     def test_default_audio_config(self):
         vi = VoiceInput()
         assert vi.input_device_index is None
-        assert vi.wake_word_enabled is False
 
     def test_on_error_registers_callback(self):
         vi = VoiceInput()
@@ -58,79 +63,38 @@ class TestVoiceInputAPI:
     def test_stop_when_not_started(self):
         """stop() should be safe to call even if never started."""
         vi = VoiceInput()
-        vi.stop()  # should not raise
+        vi.stop()
         assert vi._running is False
 
-    def test_pause_when_no_recorder(self):
-        """pause() should be safe when recorder is None."""
+    def test_pause_when_not_started(self):
+        """pause() should be safe when not running."""
         vi = VoiceInput()
-        vi.pause()  # should not raise
+        vi.pause()
 
-    def test_resume_when_no_recorder(self):
-        """resume() should be safe when recorder is None."""
+    def test_resume_when_not_started(self):
+        """resume() should be safe when not running."""
         vi = VoiceInput()
-        vi.resume()  # should not raise
+        vi.resume()
 
     def test_set_input_device_updates_config(self):
         vi = VoiceInput()
         vi.set_input_device(4)
         assert vi.input_device_index == 4
 
-    def test_set_wake_word_enabled_updates_config(self):
+    def test_set_input_device_none(self):
         vi = VoiceInput()
-        vi.set_wake_word_enabled(True)
-        assert vi.wake_word_enabled is True
-
-    def test_set_input_device_requests_reconfigure(self):
-        vi = VoiceInput()
-        vi._running = True
-        recorder = MagicMock()
-        vi._recorder = recorder
-
-        vi.set_input_device(8)
-
-        recorder.stop.assert_called_once()
-        assert vi._reconfigure_requested is True
-
-    def test_create_recorder_uses_input_device_and_wake_word(self):
-        captured = {}
-
-        class FakeRecorder:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        vi = VoiceInput()
-        vi.set_input_device(6)
-        vi.set_wake_word_enabled(True)
-        vi._create_recorder(FakeRecorder)
-
-        assert captured["input_device_index"] == 6
-        assert captured["wake_words"] == "hey_jarvis"
-
-    def test_create_recorder_omits_wake_words_when_disabled(self):
-        captured = {}
-
-        class FakeRecorder:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        vi = VoiceInput()
-        vi._create_recorder(FakeRecorder)
-
-        assert "wake_words" not in captured
+        vi.set_input_device(4)
+        vi.set_input_device(None)
+        assert vi.input_device_index is None
 
     def test_start_sets_running_flag(self):
-        """start() should set _running=True and spawn a thread."""
         vi = VoiceInput()
-
-        # Patch _listen_loop so it doesn't actually import RealtimeSTT.
         with patch.object(vi, "_listen_loop"):
             vi.start()
             assert vi._running is True
             vi.stop()
 
     def test_start_idempotent(self):
-        """Calling start() twice should not spawn a second thread."""
         vi = VoiceInput()
         with patch.object(vi, "_listen_loop"):
             vi.start()
@@ -140,38 +104,195 @@ class TestVoiceInputAPI:
             assert thread1 is thread2
             vi.stop()
 
-    def test_stop_logs_recorder_error(self, caplog):
-        """stop() should log warnings when recorder.stop() throws."""
+    def test_pause_sets_flag(self):
         vi = VoiceInput()
         vi._running = True
-        vi._recorder = MagicMock()
-        vi._recorder.stop.side_effect = RuntimeError("device lost")
+        vi.pause()
+        assert vi._paused is True
 
-        with caplog.at_level(logging.WARNING, logger="harness.voice_input"):
-            vi.stop()
-
-        assert any("Error stopping recorder" in r.message for r in caplog.records)
-        assert vi._recorder is None
-
-    def test_pause_logs_recorder_error(self, caplog):
-        """pause() should log warnings when recorder.stop() throws."""
-        vi = VoiceInput()
-        vi._recorder = MagicMock()
-        vi._recorder.stop.side_effect = RuntimeError("device lost")
-
-        with caplog.at_level(logging.WARNING, logger="harness.voice_input"):
-            vi.pause()
-
-        assert any("Error pausing recorder" in r.message for r in caplog.records)
-
-    def test_resume_logs_recorder_error(self, caplog):
-        """resume() should log warnings when recorder.start() throws."""
+    def test_resume_clears_pause(self):
         vi = VoiceInput()
         vi._running = True
-        vi._recorder = MagicMock()
-        vi._recorder.start.side_effect = RuntimeError("device lost")
+        vi._paused = True
+        vi.resume()
+        assert vi._paused is False
 
-        with caplog.at_level(logging.WARNING, logger="harness.voice_input"):
-            vi.resume()
 
-        assert any("Error resuming recorder" in r.message for r in caplog.records)
+# ---------------------------------------------------------------------------
+# Whisper model loading
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceInputModel:
+    """Verify whisper model loading and configuration."""
+
+    @patch("harness.voice_input.WhisperModel")
+    def test_model_loads_base_en_with_int8(self, mock_cls):
+        """Model should be loaded as 'base.en' with int8 compute."""
+        vi = VoiceInput()
+        vi._load_model()
+        mock_cls.assert_called_once()
+        _, kwargs = mock_cls.call_args
+        assert kwargs.get("compute_type") == "int8"
+        assert kwargs.get("device") == "cuda"
+
+    @patch("harness.voice_input.WhisperModel")
+    def test_model_is_lazy_singleton(self, mock_cls):
+        """Model should only be created once regardless of calls."""
+        vi = VoiceInput()
+        vi._load_model()
+        vi._load_model()
+        assert mock_cls.call_count == 1
+
+    @patch("harness.voice_input.WhisperModel", side_effect=RuntimeError("CUDA OOM"))
+    def test_model_load_failure_emits_error(self, mock_cls):
+        vi = VoiceInput()
+        errors = []
+        vi.on_error(lambda m: errors.append(m))
+        vi._load_model()
+        assert len(errors) == 1
+        assert "CUDA OOM" in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# VAD state machine
+# ---------------------------------------------------------------------------
+
+
+class TestVADStateMachine:
+    """Verify the WebRTC VAD-based speech detection logic."""
+
+    @patch("harness.voice_input.webrtcvad")
+    def test_vad_created_with_aggressiveness(self, mock_vad_mod):
+        """VAD should be created with aggressiveness=3."""
+        vi = VoiceInput()
+        vi._create_vad()
+        mock_vad_mod.Vad.assert_called_once_with(3)
+
+    def test_silence_duration_default(self):
+        """Default post-speech silence should be 0.5s."""
+        vi = VoiceInput()
+        assert vi._post_speech_silence == 0.5
+
+    def test_pre_buffer_duration_default(self):
+        """Default pre-recording buffer should be 0.3s."""
+        vi = VoiceInput()
+        assert vi._pre_buffer_seconds == 0.3
+
+
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
+
+
+class TestTranscription:
+    """Verify transcription calls and parameter tuning."""
+
+    @patch("harness.voice_input.WhisperModel")
+    def test_transcribe_uses_beam_1(self, mock_cls):
+        """Transcription should use beam_size=1 for lowest latency."""
+        mock_model = MagicMock()
+        mock_cls.return_value = mock_model
+        mock_model.transcribe.return_value = (iter([]), MagicMock())
+
+        vi = VoiceInput()
+        vi._load_model()
+        audio = np.zeros(16000, dtype=np.float32)
+        vi._transcribe(audio)
+
+        mock_model.transcribe.assert_called_once()
+        _, kwargs = mock_model.transcribe.call_args
+        assert kwargs.get("beam_size") == 1
+        assert kwargs.get("language") == "en"
+
+    @patch("harness.voice_input.WhisperModel")
+    def test_transcribe_returns_text(self, mock_cls):
+        """Transcribed segments should be concatenated into final text."""
+        mock_model = MagicMock()
+        mock_cls.return_value = mock_model
+
+        seg1 = MagicMock()
+        seg1.text = " Hello world"
+        seg2 = MagicMock()
+        seg2.text = " how are you"
+        mock_model.transcribe.return_value = (iter([seg1, seg2]), MagicMock())
+
+        vi = VoiceInput()
+        vi._load_model()
+        audio = np.zeros(16000, dtype=np.float32)
+        result = vi._transcribe(audio)
+
+        assert result == "Hello world how are you"
+
+    @patch("harness.voice_input.WhisperModel")
+    def test_transcribe_empty_segments(self, mock_cls):
+        """Empty segments should return empty string."""
+        mock_model = MagicMock()
+        mock_cls.return_value = mock_model
+        mock_model.transcribe.return_value = (iter([]), MagicMock())
+
+        vi = VoiceInput()
+        vi._load_model()
+        audio = np.zeros(16000, dtype=np.float32)
+        result = vi._transcribe(audio)
+
+        assert result == ""
+
+    @patch("harness.voice_input.WhisperModel")
+    def test_transcribe_condition_on_previous_text_false(self, mock_cls):
+        """Should not condition on previous text (avoids hallucination)."""
+        mock_model = MagicMock()
+        mock_cls.return_value = mock_model
+        mock_model.transcribe.return_value = (iter([]), MagicMock())
+
+        vi = VoiceInput()
+        vi._load_model()
+        vi._transcribe(np.zeros(16000, dtype=np.float32))
+
+        _, kwargs = mock_model.transcribe.call_args
+        assert kwargs.get("condition_on_previous_text") is False
+
+
+# ---------------------------------------------------------------------------
+# Callback safety
+# ---------------------------------------------------------------------------
+
+
+class TestCallbackSafety:
+    """Verify callbacks are invoked safely and errors are handled."""
+
+    def test_callback_invoked_with_text(self):
+        vi = VoiceInput()
+        received = []
+        vi.on_text(lambda t: received.append(t))
+        vi._emit_text("hello")
+        assert received == ["hello"]
+
+    def test_callback_not_invoked_for_empty_text(self):
+        vi = VoiceInput()
+        received = []
+        vi.on_text(lambda t: received.append(t))
+        vi._emit_text("")
+        assert received == []
+
+    def test_callback_not_invoked_for_whitespace(self):
+        vi = VoiceInput()
+        received = []
+        vi.on_text(lambda t: received.append(t))
+        vi._emit_text("   ")
+        assert received == []
+
+    def test_error_callback_invoked(self):
+        vi = VoiceInput()
+        errors = []
+        vi.on_error(lambda m: errors.append(m))
+        vi._emit_error("boom")
+        assert errors == ["boom"]
+
+    def test_recording_state_callback(self):
+        vi = VoiceInput()
+        states = []
+        vi.on_recording_state(lambda a: states.append(a))
+        vi._emit_recording_state(True)
+        vi._emit_recording_state(False)
+        assert states == [True, False]

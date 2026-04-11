@@ -1,7 +1,7 @@
 """Code LLM — OpenAI-compatible client + SEARCH/REPLACE parser."""
 
 import re
-from typing import Optional
+from typing import Generator, Iterator, Optional
 
 from openai import OpenAI, APIConnectionError, APITimeoutError, AuthenticationError
 
@@ -12,7 +12,7 @@ _SEARCH_RE = re.compile(
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-2.0-flash-lite"
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
@@ -44,16 +44,12 @@ Rules:
 _MAX_CONTEXT_CHARS = 100_000
 
 
-def chat(
+def _build_messages(
     query: str,
     context: Optional[str] = None,
     repo_map: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> str:
-    """Send a user query (+ file context) to the hosted LLM and return the response."""
-    if not api_key:
-        raise RuntimeError("No API key configured")
-
+) -> list[dict]:
+    """Build the messages list for the LLM request."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     user_parts = []
@@ -67,6 +63,20 @@ def chat(
     user_parts.append(f"## User request\n{query}")
 
     messages.append({"role": "user", "content": "\n".join(user_parts)})
+    return messages
+
+
+def chat(
+    query: str,
+    context: Optional[str] = None,
+    repo_map: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> str:
+    """Send a user query (+ file context) to the hosted LLM and return the response."""
+    if not api_key:
+        raise RuntimeError("No API key configured")
+
+    messages = _build_messages(query, context, repo_map)
 
     client = OpenAI(api_key=api_key, base_url=BASE_URL)
     try:
@@ -100,3 +110,136 @@ def extract_prose(text: str) -> str:
     prose = _SEARCH_RE.sub("", text).strip()
     # Collapse multiple blank lines.
     return re.sub(r"\n{3,}", "\n\n", prose)
+
+
+# =====================================================================
+# Sentence boundary detection for streaming
+# =====================================================================
+
+# Matches a SEARCH/REPLACE block anywhere in text.
+_BLOCK_START_RE = re.compile(r"<{6,8}\s*SEARCH\s*\n", re.IGNORECASE)
+_BLOCK_END_RE = re.compile(r">{6,8}\s*REPLACE\s*$", re.IGNORECASE | re.MULTILINE)
+
+# Sentence-ending punctuation followed by whitespace or end of string.
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])(?:\s|$)")
+
+
+def split_sentences_streaming(chunks: Iterator[str]) -> Generator[str, None, None]:
+    """Yield complete sentences from an iterator of text chunks.
+
+    Filters out SEARCH/REPLACE blocks so only prose is yielded.
+    """
+    buffer = ""
+    in_block = False
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+        buffer += chunk
+
+        # Handle SEARCH/REPLACE block detection
+        while buffer:
+            if in_block:
+                m = _BLOCK_END_RE.search(buffer)
+                if m:
+                    # Discard everything up to and including the block end
+                    buffer = buffer[m.end():].lstrip("\n")
+                    in_block = False
+                else:
+                    break  # Block hasn't ended yet — wait for more chunks
+            else:
+                m = _BLOCK_START_RE.search(buffer)
+                if m:
+                    # Yield any prose before the block starts
+                    prose_before = buffer[:m.start()]
+                    if prose_before.strip():
+                        yield from _flush_sentences(prose_before)
+                    buffer = buffer[m.start():]
+                    in_block = True
+                else:
+                    # No block — try to yield complete sentences
+                    sentences, buffer = _extract_complete_sentences(buffer)
+                    yield from sentences
+                    break
+
+    # Flush any remaining text
+    if buffer and not in_block:
+        remainder = buffer.strip()
+        if remainder:
+            yield remainder
+
+
+def _extract_complete_sentences(text: str) -> tuple[list[str], str]:
+    """Split text at sentence boundaries, returning (complete, remainder)."""
+    sentences = []
+    last_end = 0
+    for m in _SENTENCE_END_RE.finditer(text):
+        sentence = text[last_end:m.start() + 1].strip()
+        if sentence:
+            sentences.append(sentence)
+        last_end = m.end()
+    remainder = text[last_end:]
+    return sentences, remainder
+
+
+def _flush_sentences(text: str) -> Generator[str, None, None]:
+    """Yield all sentences from text, including any trailing fragment."""
+    sentences, remainder = _extract_complete_sentences(text)
+    yield from sentences
+    remainder = remainder.strip()
+    if remainder:
+        yield remainder
+
+
+# =====================================================================
+# Streaming chat
+# =====================================================================
+
+def chat_stream_raw(
+    query: str,
+    context: Optional[str] = None,
+    repo_map: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Generator[str, None, None]:
+    """Stream raw text deltas from the LLM as they arrive.
+
+    Yields raw delta strings without any filtering or sentence splitting.
+    The caller is responsible for sentence splitting and SEARCH/REPLACE handling.
+    """
+    if not api_key:
+        raise RuntimeError("No API key configured")
+
+    messages = _build_messages(query, context, repo_map)
+    client = OpenAI(api_key=api_key, base_url=BASE_URL)
+
+    try:
+        stream = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            timeout=REQUEST_TIMEOUT,
+            stream=True,
+        )
+    except AuthenticationError as exc:
+        raise RuntimeError(f"Invalid API key: {exc}") from exc
+    except (APIConnectionError, APITimeoutError) as exc:
+        raise RuntimeError(f"LLM unavailable: {exc}") from exc
+
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content is not None:
+            yield chunk.choices[0].delta.content
+
+
+def chat_stream(
+    query: str,
+    context: Optional[str] = None,
+    repo_map: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Generator[str, None, None]:
+    """Stream sentences from the LLM as they arrive.
+
+    Yields prose sentences one at a time, filtering out SEARCH/REPLACE blocks.
+    The full raw response is NOT returned — use chat() if you need it.
+    """
+    yield from split_sentences_streaming(
+        chat_stream_raw(query, context=context, repo_map=repo_map, api_key=api_key)
+    )

@@ -14,7 +14,7 @@ Voice Harness is a standalone desktop voice-driven coding assistant that replace
 | UI framework | PyQt6 + PyQt6-WebEngine |
 | Code editor | Monaco Editor 0.52.0 (AMD build) via QWebEngineView + QWebChannel |
 | STT | RealtimeSTT (wraps faster-whisper large-v3 + Silero VAD) |
-| Code LLM | Gemini 2.5 Pro via OpenAI SDK (hosted, 100k char context) |
+| Code LLM | Gemini 2.5 Flash via OpenAI SDK (hosted, 100k char context) |
 | TTS | Kokoro-82M (CPU, Apache 2.0) |
 | Edit format | Aider-style SEARCH/REPLACE blocks |
 | Git | gitpython — auto-commit accepted changes |

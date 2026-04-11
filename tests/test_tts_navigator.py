@@ -371,3 +371,49 @@ class TestSpeedControl:
         args, kwargs = mock_sd.play.call_args
         assert kwargs.get("samplerate") == 48000 or args[1] == 48000
         gate.set()  # release the thread
+
+
+# =====================================================================
+# Incremental loading (Phase 5 streaming)
+# =====================================================================
+
+@pytest.mark.ui
+class TestAppendChunk:
+    """Verify append_chunk() adds chunks incrementally for streaming TTS."""
+
+    def test_append_to_empty_sets_index_zero(self, qapp):
+        nav = TtsNavigator()
+        chunk = ("First.", _make_wav_bytes())
+        nav.append_chunk(*chunk)
+        assert nav.chunk_count == 1
+        assert nav.current_index == 0
+        assert nav.current_text == "First."
+
+    def test_append_emits_chunk_changed_on_first(self, qapp):
+        nav = TtsNavigator()
+        spy = QSignalSpy(nav.chunk_changed)
+        nav.append_chunk("First.", _make_wav_bytes())
+        assert len(spy) == 1
+        assert spy[0][1] == "First."
+
+    def test_append_multiple_grows_list(self, qapp):
+        nav = TtsNavigator()
+        nav.append_chunk("First.", _make_wav_bytes())
+        nav.append_chunk("Second.", _make_wav_bytes())
+        nav.append_chunk("Third.", _make_wav_bytes())
+        assert nav.chunk_count == 3
+        # Index stays on first — user hasn't navigated yet.
+        assert nav.current_index == 0
+
+    def test_append_after_load_adds_to_end(self, qapp):
+        nav = TtsNavigator()
+        nav.load(_make_chunks(2))
+        nav.append_chunk("Extra.", _make_wav_bytes())
+        assert nav.chunk_count == 3
+
+    def test_append_does_not_move_index_when_not_first(self, qapp):
+        nav = TtsNavigator()
+        nav.append_chunk("First.", _make_wav_bytes())
+        nav.append_chunk("Second.", _make_wav_bytes())
+        # index should still be 0
+        assert nav.current_index == 0

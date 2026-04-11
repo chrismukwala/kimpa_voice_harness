@@ -1,32 +1,64 @@
-"""Voice input — thin adapter around RealtimeSTT."""
+"""Voice input — direct faster-whisper + WebRTC VAD.
 
+Uses faster-whisper (CTranslate2) with the turbo model for low-latency
+transcription.  WebRTC VAD detects speech boundaries.  No RealtimeSTT
+dependency — this module owns the full mic → text pipeline.
+"""
+
+import collections
 import logging
 import threading
 import time
 from typing import Callable, Optional
 
+import numpy as np
+
 log = logging.getLogger(__name__)
+
+# Lazy imports — only resolved when the listen loop starts.
+WhisperModel = None  # type: ignore[assignment]
+webrtcvad = None  # type: ignore[assignment]
+
+# Audio constants
+SAMPLE_RATE = 16000
+FRAME_MS = 30  # WebRTC VAD requires 10, 20, or 30 ms frames
+SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000
+BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2  # 16-bit PCM
 
 
 class VoiceInput:
-    """Thin wrapper: start()/stop()/on_text(cb).
+    """Mic → text pipeline: sounddevice stream → WebRTC VAD → faster-whisper.
 
-    Nothing else in the project imports RealtimeSTT directly.
-    If RealtimeSTT needs replacing, only this file changes.
+    Public API (unchanged from Phase 4):
+        start(), stop(), pause(), resume()
+        on_text(cb), on_error(cb), on_recording_state(cb), on_status(cb)
+        set_input_device(index)
     """
 
-    def __init__(self, input_device_index: Optional[int] = None, wake_word_enabled: bool = False):
+    def __init__(self, input_device_index: Optional[int] = None):
         self._callback: Optional[Callable[[str], None]] = None
         self._error_callback: Optional[Callable[[str], None]] = None
         self._recording_state_callback: Optional[Callable[[bool], None]] = None
         self._status_callback: Optional[Callable[[str], None]] = None
-        self._recorder = None
+
         self._running = False
         self._paused = False
         self._thread: Optional[threading.Thread] = None
         self._input_device_index = input_device_index
-        self._wake_word_enabled = wake_word_enabled
-        self._reconfigure_requested = False
+
+        # Whisper model — preloaded in background thread for fast startup.
+        self._model = None
+        self._model_ready = threading.Event()
+        self._preload_thread = threading.Thread(target=self._preload_model, daemon=True)
+        self._preload_thread.start()
+
+        # Audio stream (sounddevice.InputStream)
+        self._stream = None
+
+        # VAD config
+        self._post_speech_silence = 0.5   # seconds of silence to end utterance
+        self._pre_buffer_seconds = 0.3    # audio kept before speech onset
+        self._vad = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -35,28 +67,24 @@ class VoiceInput:
     def input_device_index(self) -> Optional[int]:
         return self._input_device_index
 
-    @property
-    def wake_word_enabled(self) -> bool:
-        return self._wake_word_enabled
-
     def on_text(self, callback: Callable[[str], None]) -> None:
         """Register callback invoked with each final transcription."""
         self._callback = callback
 
     def on_error(self, callback: Callable[[str], None]) -> None:
-        """Register callback invoked when the recorder reports an error."""
+        """Register callback invoked when an error occurs."""
         self._error_callback = callback
 
     def on_recording_state(self, callback: Callable[[bool], None]) -> None:
-        """Register callback invoked when the recording state changes."""
+        """Register callback invoked when recording state changes."""
         self._recording_state_callback = callback
 
     def on_status(self, callback: Callable[[str], None]) -> None:
-        """Register callback invoked with status updates (e.g. 'loading')."""
+        """Register callback invoked with status updates."""
         self._status_callback = callback
 
     def start(self) -> None:
-        """Begin listening.  Spawns RealtimeSTT in its own thread."""
+        """Begin listening.  Spawns the listen loop in its own thread."""
         if self._running:
             return
         self._running = True
@@ -65,132 +93,206 @@ class VoiceInput:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop listening and shut down the recorder."""
+        """Stop listening and clean up resources."""
         self._running = False
         self._paused = False
-        self._stop_recorder("stopping")
+        self._stop_stream()
         self._emit_recording_state(False)
         if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=2.0)
 
     def pause(self) -> None:
-        """Temporarily mute mic input (for video calls)."""
+        """Temporarily mute mic input."""
         self._paused = True
-        self._stop_recorder("pausing")
+        self._stop_stream()
         self._emit_recording_state(False)
 
     def resume(self) -> None:
         """Resume after pause."""
         self._paused = False
-        if self._running and self._recorder is not None:
-            try:
-                self._recorder.start()
-                self._emit_recording_state(True)
-            except (RuntimeError, OSError, TypeError, ValueError):
-                log.warning("Error resuming recorder", exc_info=True)
-        elif self._running:
-            self._reconfigure_requested = True
 
     def set_input_device(self, device_index: Optional[int]) -> None:
-        """Update the microphone device and recreate the recorder if needed."""
+        """Update the microphone device.  Takes effect on next stream restart."""
         self._input_device_index = None if device_index is None else int(device_index)
-        self._request_reconfigure()
-
-    def set_wake_word_enabled(self, enabled: bool) -> None:
-        """Enable or disable wake-word gating and recreate the recorder if needed."""
-        self._wake_word_enabled = bool(enabled)
-        self._request_reconfigure()
+        # If currently running, restart the stream on next loop iteration
+        self._stop_stream()
 
     # ------------------------------------------------------------------
-    # Internal
+    # Model management
+    # ------------------------------------------------------------------
+    def _preload_model(self) -> None:
+        """Background thread: load the whisper model so it's ready before first speech."""
+        try:
+            self._load_model()
+        except Exception as exc:
+            log.error("Background model preload failed: %s", exc)
+
+    def _load_model(self) -> bool:
+        """Load the whisper base.en model.  Returns True on success."""
+        if self._model is not None:
+            self._model_ready.set()
+            return True
+        try:
+            global WhisperModel
+            if WhisperModel is None:
+                from faster_whisper import WhisperModel as _WM
+                WhisperModel = _WM
+            log.info("Loading whisper base.en model (int8)...")
+            self._model = WhisperModel(
+                "base.en",
+                device="cuda",
+                compute_type="int8",
+            )
+            self._model_ready.set()
+            log.info("Whisper base.en model loaded")
+            return True
+        except (RuntimeError, OSError, ImportError, ValueError) as exc:
+            self._model_ready.set()  # unblock waiters even on failure
+            self._emit_error(f"Whisper model load failed: {exc}")
+            return False
+
+    def _create_vad(self):
+        """Create a WebRTC VAD instance with aggressiveness=3 (most aggressive)."""
+        global webrtcvad
+        if webrtcvad is None:
+            import webrtcvad as _vad
+            webrtcvad = _vad
+        self._vad = webrtcvad.Vad(3)
+
+    # ------------------------------------------------------------------
+    # Transcription
+    # ------------------------------------------------------------------
+    def _transcribe(self, audio: np.ndarray) -> str:
+        """Run whisper on an audio array (float32, 16kHz). Returns text."""
+        if self._model is None:
+            return ""
+        segments, _ = self._model.transcribe(
+            audio,
+            beam_size=1,
+            language="en",
+            condition_on_previous_text=False,
+            vad_filter=False,  # We handle VAD ourselves
+        )
+        parts = []
+        for seg in segments:
+            parts.append(seg.text)
+        return "".join(parts).strip()
+
+    # ------------------------------------------------------------------
+    # Listen loop
     # ------------------------------------------------------------------
     def _listen_loop(self) -> None:
-        try:
-            from RealtimeSTT import AudioToTextRecorder
-        except ImportError as exc:
-            self._emit_error(f"Voice input import failed: {exc}")
-            self._emit_recording_state(False)
+        """Main loop: capture mic audio, detect speech via VAD, transcribe."""
+        import sounddevice as sd
+
+        self._emit_status("loading")
+        self._model_ready.wait()  # wait for background preload
+        if self._model is None:
             self._running = False
             return
+        self._create_vad()
+
+        # Pre-speech ring buffer (captures audio before VAD triggers)
+        pre_buf_frames = max(1, int(self._pre_buffer_seconds / (FRAME_MS / 1000)))
+        pre_buffer = collections.deque(maxlen=pre_buf_frames)
+
+        # Frames of silence needed to end an utterance
+        silence_frames_needed = int(self._post_speech_silence / (FRAME_MS / 1000))
 
         while self._running:
             if self._paused:
                 time.sleep(0.05)
                 continue
 
-            if self._recorder is None or self._reconfigure_requested:
-                self._stop_recorder("reconfiguring")
-                self._reconfigure_requested = False
-                self._emit_status("loading")
+            # (Re)open the mic stream if needed
+            if self._stream is None:
                 try:
-                    log.info(
-                        "Creating recorder (input_device=%s, wake_word=%s)",
-                        self._input_device_index,
-                        self._wake_word_enabled,
+                    self._stream = sd.InputStream(
+                        samplerate=SAMPLE_RATE,
+                        channels=1,
+                        dtype="int16",
+                        blocksize=SAMPLES_PER_FRAME,
+                        device=self._input_device_index,
                     )
-                    self._recorder = self._create_recorder(AudioToTextRecorder)
-                    self._recorder.start()
-                    log.info("Recorder started")
+                    self._stream.start()
                     self._emit_recording_state(True)
                     self._emit_status("listening")
-                except (RuntimeError, OSError, TypeError, ValueError) as exc:
-                    self._emit_error(f"Voice input start failed: {exc}")
-                    self._emit_recording_state(False)
+                except (RuntimeError, OSError, sd.PortAudioError) as exc:
+                    self._emit_error(f"Mic open failed: {exc}")
                     self._running = False
                     break
 
+            # --- Collect speech ---
+            speech_frames = []
+            silence_count = 0
+            speaking = False
+            pre_buffer.clear()
+
             try:
-                log.debug("Waiting for recorder text")
-                text = self._recorder.text() if self._recorder is not None else None
-                if text:
-                    log.info("Recorder produced transcription")
-            except (RuntimeError, OSError, TypeError, ValueError) as exc:
-                if self._paused or self._reconfigure_requested or not self._running:
-                    continue
-                self._emit_error(f"Voice input error: {exc}")
-                self._emit_recording_state(False)
-                self._reconfigure_requested = True
+                while self._running and not self._paused and self._stream is not None:
+                    data, overflowed = self._stream.read(SAMPLES_PER_FRAME)
+                    if overflowed:
+                        log.debug("Input overflow — dropped samples")
+                    frame_bytes = data.tobytes()
+
+                    is_speech = self._vad.is_speech(frame_bytes, SAMPLE_RATE)
+
+                    if not speaking:
+                        pre_buffer.append(frame_bytes)
+                        if is_speech:
+                            speaking = True
+                            silence_count = 0
+                            # Flush pre-buffer into speech
+                            speech_frames.extend(pre_buffer)
+                            pre_buffer.clear()
+                    else:
+                        speech_frames.append(frame_bytes)
+                        if is_speech:
+                            silence_count = 0
+                        else:
+                            silence_count += 1
+                            if silence_count >= silence_frames_needed:
+                                break  # End of utterance
+            except (RuntimeError, OSError) as exc:
+                log.warning("Stream read error: %s", exc)
+                self._stop_stream()
                 continue
 
-            if self._reconfigure_requested or self._paused:
+            if not speech_frames or not self._running:
                 continue
-            if text and self._callback:
-                self._callback(text.strip())
 
-        self._stop_recorder("stopping")
+            # --- Convert to float32 for whisper ---
+            raw = b"".join(speech_frames)
+            pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # --- Transcribe ---
+            self._emit_status("processing")
+            text = self._transcribe(pcm)
+            self._emit_status("listening")
+            self._emit_text(text)
+
+        self._stop_stream()
         self._emit_recording_state(False)
 
-    def _create_recorder(self, recorder_cls):
-        kwargs = {
-            "model": "large-v3",
-            "compute_type": "int8_float16",
-            "language": "en",
-            "min_gap_between_recordings": 0,
-            "spinner": False,
-            "use_microphone": True,
-            "silero_sensitivity": 0.4,
-            "post_speech_silence_duration": 1.2,
-        }
-        if self._wake_word_enabled:
-            kwargs["wake_words"] = "hey_jarvis"
-        if self._input_device_index is not None:
-            kwargs["input_device_index"] = self._input_device_index
-        return recorder_cls(**kwargs)
-
-    def _request_reconfigure(self) -> None:
-        self._reconfigure_requested = True
-        if self._running:
-            self._stop_recorder("reconfiguring")
-
-    def _stop_recorder(self, action: str) -> None:
-        if self._recorder is None:
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _stop_stream(self) -> None:
+        if self._stream is None:
             return
         try:
-            self._recorder.stop()
-        except (RuntimeError, OSError, TypeError, ValueError):
-            log.warning("Error %s recorder", action, exc_info=True)
+            self._stream.stop()
+            self._stream.close()
+        except (RuntimeError, OSError):
+            log.warning("Error closing audio stream", exc_info=True)
         finally:
-            self._recorder = None
+            self._stream = None
+
+    def _emit_text(self, text: str) -> None:
+        if not text or not text.strip():
+            return
+        if self._callback is not None:
+            self._callback(text.strip())
 
     def _emit_error(self, message: str) -> None:
         log.warning(message)

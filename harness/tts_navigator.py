@@ -94,6 +94,14 @@ class TtsNavigator(QObject):
         else:
             self._index = -1
 
+    def append_chunk(self, sentence: str, wav_bytes: bytes) -> None:
+        """Append a single chunk for incremental streaming playback."""
+        is_first = len(self._chunks) == 0
+        self._chunks.append((sentence, wav_bytes))
+        if is_first:
+            self._index = 0
+            self.chunk_changed.emit(0, sentence)
+
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
@@ -221,7 +229,8 @@ class TtsNavigator(QObject):
             return
         try:
             info = sf.info(io.BytesIO(wav_bytes))
-        except (RuntimeError, TypeError, ValueError):
+        except (RuntimeError, TypeError, ValueError) as exc:
+            log.debug("Cannot read WAV info for word highlighting: %s", exc)
             return
         samplerate = getattr(info, "samplerate", 0)
         frames = getattr(info, "frames", 0)

@@ -3,12 +3,14 @@
 import re
 import io
 import threading
-import wave
-from typing import List, Tuple
+from typing import Generator, Iterator, List, Tuple
 
 import numpy as np
 import soundfile as sf
 
+
+# Phase 5: run Kokoro on GPU for lower latency (~0.3 GB VRAM).
+TTS_DEVICE = "cuda"
 
 # Lazy singleton for Kokoro pipeline — avoids reloading the 82M model every call.
 _pipeline_lock = threading.Lock()
@@ -22,7 +24,7 @@ def _get_pipeline():
         with _pipeline_lock:
             if _pipeline is None:
                 from kokoro import KPipeline
-                _pipeline = KPipeline(lang_code="a")
+                _pipeline = KPipeline(lang_code="a", device=TTS_DEVICE)
     return _pipeline
 
 
@@ -59,6 +61,29 @@ def speak(text: str) -> List[Tuple[str, bytes]]:
         results.append((sentence, buf.getvalue()))
 
     return results
+
+
+def speak_stream(sentences: Iterator[str]) -> Generator[Tuple[str, bytes], None, None]:
+    """Yield (sentence, wav_bytes) one at a time from an iterator of sentences.
+
+    Unlike speak(), this processes each sentence as it arrives, enabling
+    playback to start while the LLM is still generating.
+    """
+    pipeline = _get_pipeline()
+    for sentence in sentences:
+        if not sentence or not sentence.strip():
+            continue
+        generator = pipeline(sentence, voice="af_heart")
+        audio_chunks = []
+        sample_rate = 24000
+        for _, _, audio in generator:
+            audio_chunks.append(audio)
+        if not audio_chunks:
+            continue
+        combined = np.concatenate(audio_chunks)
+        buf = io.BytesIO()
+        sf.write(buf, combined, sample_rate, format="WAV")
+        yield (sentence, buf.getvalue())
 
 
 def play_wav_bytes(wav_bytes: bytes):

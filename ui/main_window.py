@@ -173,6 +173,7 @@ class MainWindow(QMainWindow):
         # --- TTS Navigator (Phase 4) ---
         self._tts_nav = TtsNavigator()
         coordinator.tts_chunks_ready.connect(self._on_tts_chunks_ready)
+        coordinator.tts_chunk_ready.connect(self._on_tts_chunk_incremental)
         self._tts_nav.chunk_changed.connect(self._on_tts_chunk_changed)
         self._tts_nav.playback_error.connect(self._on_tts_playback_error)
         self._tts_nav.playback_finished.connect(self._on_tts_playback_finished)
@@ -356,10 +357,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _on_tts_chunks_ready(self, chunks) -> None:
         """Load TTS chunks into navigator and start playback immediately."""
-        self._tts_nav.load(chunks)
+        # Phase 5: chunks already loaded incrementally via tts_chunk_ready.
+        # This signal fires at the end for backward compat; only load if
+        # navigator is still empty (non-streaming fallback).
+        if self._tts_nav.chunk_count == 0:
+            self._tts_nav.load(chunks)
         has_chunks = self._tts_nav.chunk_count > 0
         self._ai_panel.enable_tts_controls(has_chunks)
-        if has_chunks:
+        if has_chunks and not self._tts_nav.is_playing:
+            self._on_tts_play_requested()
+
+    def _on_tts_chunk_incremental(self, sentence, wav_bytes) -> None:
+        """Handle a single TTS chunk arriving from the streaming pipeline."""
+        is_first = self._tts_nav.chunk_count == 0
+        self._tts_nav.append_chunk(sentence, wav_bytes)
+        self._ai_panel.enable_tts_controls(True)
+        if is_first:
             self._on_tts_play_requested()
 
     def _on_tts_chunk_changed(self, index: int, sentence: str) -> None:

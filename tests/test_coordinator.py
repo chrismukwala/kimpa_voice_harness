@@ -116,9 +116,10 @@ class TestLifecycle:
         coordinator.set_input_device(5)
         coordinator._voice.set_input_device.assert_called_once_with(5)
 
-    def test_set_wake_word_enabled_calls_voice_input(self, coordinator):
+    def test_set_wake_word_enabled_is_noop(self, coordinator):
+        """Phase 5 — wake word removed, method is a no-op."""
         coordinator.set_wake_word_enabled(True)
-        coordinator._voice.set_wake_word_enabled.assert_called_once_with(True)
+        # Should not forward to voice input — it's a pass-through no-op.
 
     def test_set_api_key_stores_key(self, coordinator):
         coordinator.set_api_key("my-secret-key")
@@ -143,40 +144,66 @@ class TestLifecycle:
 
 
 class TestProcessMessage:
-    """Verify _process_message calls LLM and TTS in order."""
+    """Verify _process_message calls streaming LLM and TTS in order."""
+
+    @staticmethod
+    def _setup_streaming_mocks(mock_llm, mock_tts, response_text, prose=""):
+        """Wire up chat_stream_raw → split_sentences_streaming → speak_stream mocks."""
+        mock_llm.chat_stream_raw.return_value = iter([response_text])
+        mock_llm.extract_prose.return_value = prose
+        mock_llm.parse_search_replace.return_value = []
+
+        def fake_splitter(chunks):
+            for chunk in chunks:
+                pass  # consume so _capturing_stream populates full_response_parts
+            if prose:
+                yield prose
+
+        mock_llm.split_sentences_streaming.side_effect = fake_splitter
+
+        def fake_speak(sentences):
+            for s in sentences:
+                yield (s, b"wav")
+
+        mock_tts.speak_stream.side_effect = fake_speak
 
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_process_message_calls_llm(self, mock_llm, mock_tts, coordinator):
-        mock_llm.chat.return_value = "response text"
-        mock_llm.extract_prose.return_value = ""
+        self._setup_streaming_mocks(mock_llm, mock_tts, "response text")
 
         coordinator._api_key = "test-key"
         msg = {"query": "hello", "context": None, "repo_map": None}
         coordinator._process_message(msg)
 
-        mock_llm.chat.assert_called_once_with(
+        mock_llm.chat_stream_raw.assert_called_once_with(
             "hello", context=None, repo_map=None, api_key="test-key"
         )
 
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_process_message_skips_tts_when_no_prose(self, mock_llm, mock_tts, coordinator):
-        mock_llm.chat.return_value = "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"
-        mock_llm.extract_prose.return_value = ""
+        self._setup_streaming_mocks(
+            mock_llm, mock_tts,
+            "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE",
+        )
+
+        # Connect signal spy BEFORE processing so it captures any emissions.
+        received = []
+        coordinator.tts_chunk_ready.connect(lambda s, w: received.append((s, w)))
 
         coordinator._api_key = "test-key"
         msg = {"query": "fix it", "context": None, "repo_map": None}
         coordinator._process_message(msg)
 
-        mock_tts.speak.assert_not_called()
+        assert len(received) == 0
 
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_process_message_calls_tts_when_prose_exists(self, mock_llm, mock_tts, coordinator):
-        mock_llm.chat.return_value = "I fixed the bug."
-        mock_llm.extract_prose.return_value = "I fixed the bug."
-        mock_tts.speak.return_value = [("I fixed the bug.", b"wav")]
+        self._setup_streaming_mocks(
+            mock_llm, mock_tts, "I fixed the bug.", prose="I fixed the bug."
+        )
 
         received = []
         coordinator.tts_chunks_ready.connect(lambda chunks: received.append(chunks))
@@ -185,7 +212,6 @@ class TestProcessMessage:
         msg = {"query": "fix it", "context": None, "repo_map": None}
         coordinator._process_message(msg)
 
-        mock_tts.speak.assert_called_once_with("I fixed the bug.")
         assert len(received) == 1
         assert received[0] == [("I fixed the bug.", b"wav")]
 
@@ -201,7 +227,7 @@ class TestProcessMessage:
         msg = {"query": "hello", "context": None, "repo_map": None}
         coordinator._process_message(msg)
 
-        mock_llm.chat.assert_not_called()
+        mock_llm.chat_stream.assert_not_called()
         assert len(errors) == 1
         assert "API key" in errors[0]
 
@@ -210,14 +236,13 @@ class TestProcessMessage:
     @patch("harness.coordinator.code_llm")
     def test_process_message_uses_env_var_fallback(self, mock_llm, mock_tts, coordinator):
         """When _api_key is None, fall back to GEMINI_API_KEY env var."""
-        mock_llm.chat.return_value = "ok"
-        mock_llm.extract_prose.return_value = ""
+        self._setup_streaming_mocks(mock_llm, mock_tts, "ok")
 
         coordinator._api_key = None
         msg = {"query": "hello", "context": None, "repo_map": None}
         coordinator._process_message(msg)
 
-        mock_llm.chat.assert_called_once_with(
+        mock_llm.chat_stream_raw.assert_called_once_with(
             "hello", context=None, repo_map=None, api_key="env-key"
         )
 
@@ -253,6 +278,27 @@ class TestThreadSafety:
 class TestResponseSplitter:
     """Verify _process_message splits edits from prose (Phase 3a)."""
 
+    @staticmethod
+    def _wire(mock_llm, mock_tts, response, prose="", edits=None):
+        """Helper to set up streaming mocks for response splitter tests."""
+        mock_llm.chat_stream_raw.return_value = iter([response])
+        mock_llm.extract_prose.return_value = prose
+        mock_llm.parse_search_replace.return_value = edits or []
+
+        def fake_splitter(chunks):
+            for chunk in chunks:
+                pass  # consume so _capturing_stream populates full_response_parts
+            if prose:
+                yield prose
+
+        mock_llm.split_sentences_streaming.side_effect = fake_splitter
+
+        def fake_speak(sentences):
+            for s in sentences:
+                yield (s, b"wav")
+
+        mock_tts.speak_stream.side_effect = fake_speak
+
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_emits_edits_proposed_when_blocks_present(self, mock_llm, mock_tts, coordinator):
@@ -264,12 +310,11 @@ class TestResponseSplitter:
             "new line\n"
             ">>>>>>> REPLACE"
         )
-        mock_llm.chat.return_value = llm_response
-        mock_llm.extract_prose.return_value = "I fixed the bug."
-        mock_llm.parse_search_replace.return_value = [
-            {"search": "old line", "replace": "new line"}
-        ]
-        mock_tts.speak.return_value = [("I fixed the bug.", b"wav")]
+        self._wire(
+            mock_llm, mock_tts, llm_response,
+            prose="I fixed the bug.",
+            edits=[{"search": "old line", "replace": "new line"}],
+        )
 
         received = []
         coordinator.edits_proposed.connect(lambda data: received.append(data))
@@ -286,16 +331,15 @@ class TestResponseSplitter:
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_no_edits_proposed_for_prose_only(self, mock_llm, mock_tts, coordinator):
-        mock_llm.chat.return_value = "Just an explanation."
-        mock_llm.extract_prose.return_value = "Just an explanation."
-        mock_llm.parse_search_replace.return_value = []
-        mock_tts.speak.return_value = [("Just an explanation.", b"wav")]
+        self._wire(
+            mock_llm, mock_tts, "Just an explanation.",
+            prose="Just an explanation.",
+        )
 
         received = []
         coordinator.edits_proposed.connect(lambda data: received.append(data))
 
         coordinator._api_key = "test-key"
-
         msg = {"query": "what is this?", "context": None, "repo_map": None}
         coordinator._process_message(msg)
 
@@ -305,11 +349,11 @@ class TestResponseSplitter:
     @patch("harness.coordinator.code_llm")
     def test_edits_proposed_includes_preview(self, mock_llm, mock_tts, coordinator):
         """edits_proposed should include both original and modified content."""
-        mock_llm.chat.return_value = "<<<<<<< SEARCH\nalpha\n=======\nbeta\n>>>>>>> REPLACE"
-        mock_llm.extract_prose.return_value = ""
-        mock_llm.parse_search_replace.return_value = [
-            {"search": "alpha", "replace": "beta"}
-        ]
+        self._wire(
+            mock_llm, mock_tts,
+            "<<<<<<< SEARCH\nalpha\n=======\nbeta\n>>>>>>> REPLACE",
+            edits=[{"search": "alpha", "replace": "beta"}],
+        )
 
         received = []
         coordinator.edits_proposed.connect(lambda data: received.append(data))
@@ -327,32 +371,36 @@ class TestResponseSplitter:
     @patch("harness.coordinator.code_llm")
     def test_still_calls_tts_when_edits_and_prose(self, mock_llm, mock_tts, coordinator):
         """Even when edits exist, prose should still go to TTS."""
-        mock_llm.chat.return_value = (
+        response = (
             "Here's the fix.\n"
             "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"
         )
-        mock_llm.extract_prose.return_value = "Here's the fix."
-        mock_llm.parse_search_replace.return_value = [
-            {"search": "old", "replace": "new"}
-        ]
-        mock_tts.speak.return_value = [("Here's the fix.", b"wav")]
+        self._wire(
+            mock_llm, mock_tts, response,
+            prose="Here's the fix.",
+            edits=[{"search": "old", "replace": "new"}],
+        )
+
+        chunks_received = []
+        coordinator.tts_chunk_ready.connect(lambda s, w: chunks_received.append((s, w)))
 
         coordinator._api_key = "test-key"
         coordinator.set_file_context("/f.py", "old\n")
         msg = {"query": "fix", "context": "old\n", "repo_map": None}
         coordinator._process_message(msg)
 
-        mock_tts.speak.assert_called_once_with("Here's the fix.")
+        assert len(chunks_received) == 1
+        assert chunks_received[0][0] == "Here's the fix."
 
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_edit_apply_failure_emits_error(self, mock_llm, mock_tts, coordinator):
         """If edits can't be applied, emit an error instead of edits_proposed."""
-        mock_llm.chat.return_value = "<<<<<<< SEARCH\nnonexistent\n=======\nnew\n>>>>>>> REPLACE"
-        mock_llm.extract_prose.return_value = ""
-        mock_llm.parse_search_replace.return_value = [
-            {"search": "nonexistent", "replace": "new"}
-        ]
+        self._wire(
+            mock_llm, mock_tts,
+            "<<<<<<< SEARCH\nnonexistent\n=======\nnew\n>>>>>>> REPLACE",
+            edits=[{"search": "nonexistent", "replace": "new"}],
+        )
 
         edits_received = []
         errors_received = []
@@ -506,16 +554,33 @@ class TestPipelineLoopShutdown:
 
 
 class TestTtsChunksSignal:
-    """Verify Phase 4 — TTS chunks are emitted via signal, not played inline."""
+    """Verify Phase 4/5 — TTS chunks are emitted via signal, not played inline."""
+
+    @staticmethod
+    def _wire(mock_llm, mock_tts, response, prose=""):
+        mock_llm.chat_stream_raw.return_value = iter([response])
+        mock_llm.extract_prose.return_value = prose
+        mock_llm.parse_search_replace.return_value = []
+
+        def fake_splitter(chunks):
+            for chunk in chunks:
+                pass  # consume so _capturing_stream populates full_response_parts
+            if prose:
+                yield prose
+
+        mock_llm.split_sentences_streaming.side_effect = fake_splitter
+
+        def fake_speak(sentences):
+            for s in sentences:
+                yield (s, b"wav")
+
+        mock_tts.speak_stream.side_effect = fake_speak
 
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_tts_chunks_ready_emitted(self, mock_llm, mock_tts, coordinator):
         """When prose exists, tts_chunks_ready should be emitted with chunks."""
-        mock_llm.chat.return_value = "I fixed it."
-        mock_llm.extract_prose.return_value = "I fixed it."
-        mock_llm.parse_search_replace.return_value = []
-        mock_tts.speak.return_value = [("I fixed it.", b"wav")]
+        self._wire(mock_llm, mock_tts, "I fixed it.", prose="I fixed it.")
 
         received = []
         coordinator.tts_chunks_ready.connect(lambda chunks: received.append(chunks))
@@ -532,11 +597,10 @@ class TestTtsChunksSignal:
     @patch("harness.coordinator.code_llm")
     def test_no_tts_chunks_when_no_prose(self, mock_llm, mock_tts, coordinator):
         """No tts_chunks_ready signal when prose is empty."""
-        mock_llm.chat.return_value = "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"
-        mock_llm.extract_prose.return_value = ""
-        mock_llm.parse_search_replace.return_value = [
-            {"search": "old", "replace": "new"}
-        ]
+        self._wire(
+            mock_llm, mock_tts,
+            "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE",
+        )
 
         received = []
         coordinator.tts_chunks_ready.connect(lambda chunks: received.append(chunks))
@@ -550,11 +614,8 @@ class TestTtsChunksSignal:
     @patch("harness.coordinator.tts_mod")
     @patch("harness.coordinator.code_llm")
     def test_tts_does_not_play_inline(self, mock_llm, mock_tts, coordinator):
-        """Phase 4 — coordinator should NOT call play_wav_bytes directly."""
-        mock_llm.chat.return_value = "Done."
-        mock_llm.extract_prose.return_value = "Done."
-        mock_llm.parse_search_replace.return_value = []
-        mock_tts.speak.return_value = [("Done.", b"wav")]
+        """Coordinator should NOT call play_wav_bytes directly."""
+        self._wire(mock_llm, mock_tts, "Done.", prose="Done.")
 
         coordinator._api_key = "test-key"
 
@@ -569,10 +630,7 @@ class TestTtsChunksSignal:
         self, mock_llm, mock_tts, coordinator
     ):
         """Coordinator should hand off chunks without marking playback complete."""
-        mock_llm.chat.return_value = "Done."
-        mock_llm.extract_prose.return_value = "Done."
-        mock_llm.parse_search_replace.return_value = []
-        mock_tts.speak.return_value = [("Done.", b"wav")]
+        self._wire(mock_llm, mock_tts, "Done.", prose="Done.")
 
         states = []
         started = []
@@ -627,3 +685,127 @@ class TestTtsPlaybackLifecycle:
 
         assert states == []
         assert finished == []
+
+
+class TestStreamingPipeline:
+    """Phase 5 — verify _process_message uses streaming LLM → TTS pipeline."""
+
+    @staticmethod
+    def _wire(mock_llm, mock_tts, chunks, sentences=None, prose="", edits=None):
+        """Wire streaming mocks so generators consume their inputs properly."""
+        mock_llm.chat_stream_raw.return_value = iter(chunks)
+        mock_llm.extract_prose.return_value = prose
+        mock_llm.parse_search_replace.return_value = edits or []
+
+        sentence_list = sentences if sentences is not None else ([prose] if prose else [])
+
+        def fake_splitter(input_chunks):
+            for chunk in input_chunks:
+                pass  # consume so _capturing_stream populates full_response_parts
+            yield from sentence_list
+
+        mock_llm.split_sentences_streaming.side_effect = fake_splitter
+
+        def fake_speak(input_sentences):
+            for s in input_sentences:
+                yield (s, b"wav")
+
+        mock_tts.speak_stream.side_effect = fake_speak
+
+    @patch("harness.coordinator.tts_mod")
+    @patch("harness.coordinator.code_llm")
+    def test_uses_chat_stream_raw_instead_of_chat(self, mock_llm, mock_tts, coordinator):
+        """_process_message should call chat_stream_raw(), not chat()."""
+        self._wire(mock_llm, mock_tts, ["Hello."], sentences=["Hello."])
+
+        coordinator._api_key = "test-key"
+        msg = {"query": "hi", "context": None, "repo_map": None}
+        coordinator._process_message(msg)
+
+        mock_llm.chat_stream_raw.assert_called_once()
+        mock_llm.chat.assert_not_called()
+
+    @patch("harness.coordinator.tts_mod")
+    @patch("harness.coordinator.code_llm")
+    def test_emits_tts_chunk_ready_per_sentence(self, mock_llm, mock_tts, coordinator):
+        """Each sentence should trigger a separate tts_chunk_ready signal."""
+        self._wire(
+            mock_llm, mock_tts,
+            ["First. ", "Second."],
+            sentences=["First.", "Second."],
+        )
+
+        received = []
+        coordinator.tts_chunk_ready.connect(lambda s, w: received.append((s, w)))
+
+        coordinator._api_key = "test-key"
+        msg = {"query": "hello", "context": None, "repo_map": None}
+        coordinator._process_message(msg)
+
+        assert len(received) == 2
+        assert received[0] == ("First.", b"wav")
+        assert received[1] == ("Second.", b"wav")
+
+    @patch("harness.coordinator.tts_mod")
+    @patch("harness.coordinator.code_llm")
+    def test_accumulates_full_response(self, mock_llm, mock_tts, coordinator):
+        """llm_response_ready should contain the full accumulated response."""
+        self._wire(
+            mock_llm, mock_tts,
+            ["Hello ", "world."],
+            sentences=["Hello world."],
+            prose="Hello world.",
+        )
+
+        responses = []
+        coordinator.llm_response_ready.connect(lambda r: responses.append(r))
+
+        coordinator._api_key = "test-key"
+        msg = {"query": "hi", "context": None, "repo_map": None}
+        coordinator._process_message(msg)
+
+        assert len(responses) == 1
+        assert responses[0] == "Hello world."
+
+    @patch("harness.coordinator.tts_mod")
+    @patch("harness.coordinator.code_llm")
+    def test_parses_edits_from_full_response(self, mock_llm, mock_tts, coordinator):
+        """Edits should be parsed from the full accumulated response."""
+        full = "Fix.\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"
+        self._wire(
+            mock_llm, mock_tts,
+            [full],
+            sentences=["Fix."],
+            prose="Fix.",
+            edits=[{"search": "old", "replace": "new"}],
+        )
+
+        edits_received = []
+        coordinator.edits_proposed.connect(lambda d: edits_received.append(d))
+
+        coordinator._api_key = "test-key"
+        coordinator.set_file_context("/f.py", "old\n")
+        msg = {"query": "fix", "context": "old\n", "repo_map": None}
+        coordinator._process_message(msg)
+
+        mock_llm.parse_search_replace.assert_called_once_with(full)
+        assert len(edits_received) == 1
+
+    @patch("harness.coordinator.tts_mod")
+    @patch("harness.coordinator.code_llm")
+    def test_no_tts_when_stream_yields_nothing(self, mock_llm, mock_tts, coordinator):
+        """When speak_stream yields nothing, no tts_chunk_ready emitted."""
+        self._wire(
+            mock_llm, mock_tts,
+            ["<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"],
+            sentences=[],
+        )
+
+        received = []
+        coordinator.tts_chunk_ready.connect(lambda s, w: received.append((s, w)))
+
+        coordinator._api_key = "test-key"
+        msg = {"query": "fix", "context": None, "repo_map": None}
+        coordinator._process_message(msg)
+
+        assert len(received) == 0

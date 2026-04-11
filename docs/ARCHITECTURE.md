@@ -31,7 +31,7 @@ Mic → VoiceInput (RealtimeSTT)
    │  1. STT text arrives (or manual text input)              │
    │  2. context_assembler [stub: pass-through]               │
    │     → Builds: {"query", "context", "repo_map"}          │
-   │  3. code_llm.chat() → Gemini 2.5 Pro → full response text  │
+   │  3. code_llm.chat() → Gemini 2.5 Flash → full response text  │
    │  4. response_splitter [stub: pass-through]               │
    │     → Separates prose from SEARCH/REPLACE blocks         │
    │  5. tts.speak(prose) → List[Tuple[str, bytes]]          │
@@ -72,7 +72,7 @@ This format is intentionally over-specified for Phase 1 so that Phase 3 doesn't 
 - Exposes default-device lookup for startup selection
 
 ### `harness/code_llm.py`
-- Gemini 2.5 Pro client via OpenAI-compatible SDK
+- Gemini 2.5 Flash client via OpenAI-compatible SDK
 - `chat(query, context, repo_map, api_key) → str` — full LLM response
 - `parse_search_replace(text) → list[dict]` — lenient regex parser (6-8 chevrons)
 - `extract_prose(text) → str` — strips edit blocks, returns TTS-ready prose
@@ -159,7 +159,7 @@ RTX 4080 Laptop — 12GB VRAM
                          Total   ~2.5 GB   ✓ comfortable
 ```
 
-**Gemini 2.5 Pro runs in the cloud — no local VRAM needed for LLM.**
+**Gemini 2.5 Flash runs in the cloud — no local VRAM needed for LLM.**
 **Previously: Ollama + Qwen2.5-Coder:14b consumed ~9 GB, leaving only ~1.5 GB headroom.**
 
 ## Threading Model

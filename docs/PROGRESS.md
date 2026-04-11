@@ -18,6 +18,7 @@
 | Phase 3b | **DONE** | Tree-sitter repo map context enhancement |
 | Phase 4 | **STABILIZING** | Audio recovery, device config, indicator, and highlighting are implemented; hardware validation is pending |
 | LLM Migration | **DONE** | Ollama → Gemini 2.5 Pro via OpenAI SDK |
+| Phase 5 | **IMPLEMENTED** | 3-model streaming pipeline: whisper-turbo STT, Gemini Flash streaming LLM, Kokoro GPU TTS |
 
 ## Detailed Log
 
@@ -312,9 +313,62 @@ Remaining validation blocker:
 ### Phase 4: Deferred to Future
 
 Features planned but pushed to a future phase:
-- Custom "hey harness" wake word (OpenWakeWord + Piper TTS synthetic corpus)
 - Code explanation vs. summarization LLM modes
 - Application icons
+
+### Phase 5: 3-Model Streaming Pipeline — IMPLEMENTED (2026-04-11)
+
+Goal: Replace RealtimeSTT wrapper with direct faster-whisper, add streaming LLM → TTS pipeline
+for reduced end-to-end latency, move Kokoro to GPU, drop wake word support.
+
+Completed work:
+- **`harness/voice_input.py`** — Full rewrite: replaced RealtimeSTT wrapper with direct
+  faster-whisper WhisperModel("turbo") + WebRTC VAD + sounddevice.InputStream
+  - Lazy model loading: `WhisperModel("turbo", device="cuda", compute_type="int8_float16")`
+  - WebRTC VAD (aggressiveness=3, 30ms frames at 16kHz)
+  - Ring buffer for 0.3s pre-speech audio capture
+  - 0.5s post-speech silence detection (down from 1.2s)
+  - Removed wake word support entirely
+  - Same public API preserved: `start()`, `stop()`, `pause()`, `resume()`, `on_text()`, etc.
+  - 32 tests across 5 classes (API, model, VAD, transcription, callback safety)
+- **`harness/code_llm.py`** — Added streaming capabilities
+  - `chat_stream_raw()` — generator using `stream=True` for Gemini API, yields raw text deltas
+  - `chat_stream()` — convenience wrapper that filters raw deltas through `split_sentences_streaming()`
+  - `split_sentences_streaming()` — sentence boundary detection from streaming text deltas,
+    filters out SEARCH/REPLACE blocks mid-stream
+  - `_build_messages()` — extracted shared helper from `chat()` and `chat_stream()`
+  - 19 new tests: 7 for sentence splitter, 5 for chat_stream, 7 for chat_stream_raw (incl. error paths)
+- **`harness/tts.py`** — GPU mode + streaming generator
+  - `TTS_DEVICE = "cuda"` — Kokoro runs on GPU (~0.3 GB VRAM)
+  - `_get_pipeline()` now passes `device=TTS_DEVICE` to KPipeline
+  - `speak_stream(sentences: Iterator[str])` — yields `(sentence, wav_bytes)` one at a time
+    as sentences arrive, enabling playback before LLM finishes
+  - 4 new tests: 3 for speak_stream, 1 for TTS_DEVICE
+- **`harness/coordinator.py`** — Streaming pipeline rearchitecture
+  - `_process_message()` rewritten: `chat_stream_raw()` → `_capturing_stream()` closure
+    (accumulates raw deltas for edit parsing) → `split_sentences_streaming()` (prose filtering) →
+    `speak_stream()` → incremental `tts_chunk_ready` signals
+  - New signal: `tts_chunk_ready(str, object)` — emits each (sentence, wav_bytes) individually
+  - Raw response preserved in `_capturing_stream()` closure so `parse_search_replace()` sees
+    SEARCH/REPLACE blocks and edit detection works correctly
+  - `tts_chunks_ready` emitted at end with full list for backward compatibility
+  - `set_wake_word_enabled()` is now a no-op
+  - 5 new streaming pipeline tests
+- **`harness/tts_navigator.py`** — Incremental loading support
+  - `append_chunk(sentence, wav_bytes)` — adds one chunk at a time for streaming playback
+  - Sets index to 0 and emits `chunk_changed` on first append
+  - 5 new tests for append_chunk behavior
+- **`requirements.txt`** — Updated dependencies
+  - Added `faster-whisper>=1.1.0` (replaces RealtimeSTT)
+  - Removed `RealtimeSTT>=0.3.104` and `openwakeword>=0.6.0`
+
+VRAM budget (estimated):
+- whisper-large-v3-turbo (int8_float16): ~0.8 GB
+- Kokoro-82M (GPU): ~0.3 GB
+- OS/Qt overhead: ~1.0 GB
+- **Total: ~2.1 GB of 12 GB available**
+
+Full suite after the change: **375 passed, 1 skipped**.
 
 ### Phase 2 QA: Post-Review Hardening — DONE (2025-04-09)
 
@@ -345,6 +399,39 @@ Completed work:
 - **`setup/install.py`** — Removed Ollama preflight, `step_model()`, and connectivity check. Validation now checks `openai` import. Reduced from 7-step to 6-step wizard.
 - **Tests rewritten/added**: `test_code_llm.py` TestChat mocks OpenAI instead of Ollama. `test_coordinator.py` updated for API key flow + 3 new tests. `test_audio_settings.py` + 4 API key tests. `test_ai_panel.py` + 7 LLM settings tests. `test_main_window.py` updated _FakeAudioSettings.
 - Full suite after the change: **338 passed, 1 skipped**.
+
+### Phase 5 QA: Review Corrections — DONE (2026-04-11)
+
+Four-agent review identified 2 critical and 8 high/medium issues. All fixed:
+
+1. **CRITICAL — Edit detection pipeline restored** — `_process_message()` was calling
+   `chat_stream()` which already filtered SEARCH/REPLACE blocks via `split_sentences_streaming()`.
+   The accumulated `full_response_parts` contained only prose, so `parse_search_replace()` always
+   returned `[]`. Fix: added `chat_stream_raw()` to `code_llm.py` that yields raw text deltas;
+   coordinator now uses `chat_stream_raw()` → `_capturing_stream()` (accumulates raw text) →
+   `split_sentences_streaming()` (one-pass filter for TTS). Edit detection is fully operational.
+2. **CRITICAL — Streaming TTS connected** — `MainWindow` never connected `tts_chunk_ready` signal
+   to `TtsNavigator.append_chunk()`. Added `_on_tts_chunk_incremental()` handler: appends each
+   chunk, enables TTS controls, and auto-plays on the first chunk.
+3. **HIGH — Double sentence-splitting eliminated** — Fixed by #1: raw deltas go through
+   `split_sentences_streaming()` exactly once.
+4. **HIGH — Import ordering** — Moved `import git` from local-import group to third-party group
+   in `coordinator.py`.
+5. **HIGH — Test mocks corrected** — All coordinator test helpers updated: `chat_stream` →
+   `chat_stream_raw`. `test_process_message_skips_tts_when_no_prose` signal spy connected before
+   processing instead of after. Added 7 `chat_stream_raw` tests (incl. 3 error path tests for
+   `AuthenticationError`, `APIConnectionError`, `APITimeoutError`). Added 4 incremental TTS
+   connection tests in `test_main_window.py`.
+6. **MEDIUM — Unused imports removed** — `import struct` from `voice_input.py`, `import wave`
+   from `tts.py`.
+7. **MEDIUM — Silent exception handlers logged** — `_on_voice_recording_state`,
+   `_on_voice_status` in `coordinator.py` and `_start_word_highlight` in `tts_navigator.py` now
+   log debug messages instead of silently passing.
+8. **MEDIUM — Model name in AGENTS.md** — Updated from "Gemini 2.5 Pro" to "Gemini 2.5 Flash"
+   to match `MODEL = "gemini-2.5-flash"` in code.
+9. **LOW — Duplicate gitpython** — Removed second `gitpython>=3.1.40` entry from
+   `requirements.txt`.
+10. **LOW — Phase 5 date** — Fixed from 2026-04-12 to 2026-04-11.
 
 ## Blockers
 

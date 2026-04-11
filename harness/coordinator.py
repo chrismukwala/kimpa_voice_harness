@@ -8,12 +8,13 @@ from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+import git as _git
+
 from harness.voice_input import VoiceInput
 from harness import code_llm
 from harness import tts as tts_mod
 from harness import edit_applier
 from harness import git_ops
-import git as _git
 from harness import repo_map as repo_map_mod
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class Coordinator(QObject):
     tts_started = pyqtSignal()
     tts_finished = pyqtSignal()
     tts_chunks_ready = pyqtSignal(list)      # List[Tuple[str, bytes]] for TtsNavigator
+    tts_chunk_ready = pyqtSignal(str, object)  # Phase 5: incremental (sentence, wav_bytes)
     error_occurred = pyqtSignal(str)
     recording_active_changed = pyqtSignal(bool)
     edits_proposed = pyqtSignal(dict)       # {file_path, edits, original, modified}
@@ -103,8 +105,8 @@ class Coordinator(QObject):
         self._voice.set_input_device(device_index)
 
     def set_wake_word_enabled(self, enabled: bool) -> None:
-        """Apply wake-word mode through the voice adapter."""
-        self._voice.set_wake_word_enabled(enabled)
+        """No-op — wake word support removed in Phase 5."""
+        pass
 
     def set_api_key(self, key: Optional[str]) -> None:
         """Set the API key for the hosted LLM."""
@@ -179,13 +181,13 @@ class Coordinator(QObject):
         try:
             self.recording_active_changed.emit(active)
         except RuntimeError:
-            pass
+            log.debug("Coordinator deleted; swallowing recording_state")
 
     def _on_voice_status(self, status: str) -> None:
         try:
             self.state_changed.emit(status)
         except RuntimeError:
-            pass
+            log.debug("Coordinator deleted; swallowing status: %s", status)
 
     def _enqueue(self, query: str):
         with self._context_lock:
@@ -284,23 +286,39 @@ class Coordinator(QObject):
     def _process_message(self, msg: dict):
         self.state_changed.emit("processing")
 
-        # --- context_assembler stub (pass-through for Phase 1) ---
         query = msg["query"]
         context = msg["context"]
         repo_map = msg["repo_map"]
 
-        # --- LLM ---
+        # --- API key ---
         api_key = self._api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             self.error_occurred.emit("No API key configured — set one in LLM Settings")
             self.state_changed.emit("listening")
             return
-        response = code_llm.chat(query, context=context, repo_map=repo_map, api_key=api_key)
-        self.llm_response_ready.emit(response)
+
+        # --- Streaming LLM → sentence detection → TTS pipeline ---
+        full_response_parts: list[str] = []
+
+        def _capturing_stream():
+            for chunk in code_llm.chat_stream_raw(
+                query, context=context, repo_map=repo_map, api_key=api_key
+            ):
+                full_response_parts.append(chunk)
+                yield chunk
+
+        sentences = code_llm.split_sentences_streaming(_capturing_stream())
+        tts_chunks: list = []
+        for sentence, wav_bytes in tts_mod.speak_stream(sentences):
+            tts_chunks.append((sentence, wav_bytes))
+            self.tts_chunk_ready.emit(sentence, wav_bytes)
+
+        full_response = "".join(full_response_parts)
+        self.llm_response_ready.emit(full_response)
 
         # --- response_splitter (Phase 3a) ---
-        prose = code_llm.extract_prose(response)
-        edits = code_llm.parse_search_replace(response)
+        prose = code_llm.extract_prose(full_response)
+        edits = code_llm.parse_search_replace(full_response)
         self.prose_ready.emit(prose)
 
         # --- Propose edits if any SEARCH/REPLACE blocks found ---
@@ -321,11 +339,9 @@ class Coordinator(QObject):
                 for err in result.errors:
                     self.error_occurred.emit(f"Edit failed: {err}")
 
-        # --- TTS ---
-        if prose:
-            chunks = tts_mod.speak(prose)
-            if chunks:
-                self.tts_chunks_ready.emit(chunks)
-                return
+        # --- Emit collected chunks for backward compat ---
+        if tts_chunks:
+            self.tts_chunks_ready.emit(tts_chunks)
+            return
 
         self.state_changed.emit("listening")
