@@ -9,8 +9,12 @@ import numpy as np
 import soundfile as sf
 
 
-# Phase 5: run Kokoro on GPU for lower latency (~0.3 GB VRAM).
-TTS_DEVICE = "cuda"
+# Run Kokoro on GPU if available, otherwise fall back to CPU.
+try:
+    import torch as _torch
+    TTS_DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
+except ImportError:
+    TTS_DEVICE = "cpu"
 
 # Lazy singleton for Kokoro pipeline — avoids reloading the 82M model every call.
 _pipeline_lock = threading.Lock()
