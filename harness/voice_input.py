@@ -56,8 +56,14 @@ class VoiceInput:
         self._stream = None
 
         # VAD config
-        self._post_speech_silence = 0.5   # seconds of silence to end utterance
+        self._post_speech_silence = 1.2   # seconds of silence to end utterance (D: increased from 0.5)
         self._pre_buffer_seconds = 0.3    # audio kept before speech onset
+        self._min_speech_seconds = 1.0    # (C) utterances shorter than this are discarded
+        self._min_words = 3               # (A) utterances with fewer words are discarded
+
+        # Push-to-talk
+        self._ptt_mode = False
+        self._ptt_active = threading.Event()
         self._vad = None
 
     # ------------------------------------------------------------------
@@ -117,6 +123,21 @@ class VoiceInput:
         # If currently running, restart the stream on next loop iteration
         self._stop_stream()
 
+    def set_ptt_mode(self, enabled: bool) -> None:
+        """Switch between push-to-talk mode and VAD mode."""
+        self._ptt_mode = enabled
+        if not enabled:
+            self._ptt_active.clear()
+
+    def ptt_press(self) -> None:
+        """Signal that the push-to-talk button is being held."""
+        if self._ptt_mode:
+            self._ptt_active.set()
+
+    def ptt_release(self) -> None:
+        """Signal that the push-to-talk button was released."""
+        self._ptt_active.clear()
+
     # ------------------------------------------------------------------
     # Model management
     # ------------------------------------------------------------------
@@ -171,7 +192,7 @@ class VoiceInput:
             beam_size=1,
             language="en",
             condition_on_previous_text=False,
-            vad_filter=False,  # We handle VAD ourselves
+            vad_filter=True,  # (B) Whisper Silero VAD strips non-speech before decoding
         )
         parts = []
         for seg in segments:
@@ -223,48 +244,72 @@ class VoiceInput:
                     break
 
             # --- Collect speech ---
-            speech_frames = []
-            silence_count = 0
-            speaking = False
-            pre_buffer.clear()
-
-            try:
-                while self._running and not self._paused and self._stream is not None:
-                    data, overflowed = self._stream.read(SAMPLES_PER_FRAME)
-                    if overflowed:
-                        log.debug("Input overflow — dropped samples")
-                    frame_bytes = data.tobytes()
-
-                    is_speech = self._vad.is_speech(frame_bytes, SAMPLE_RATE)
-
-                    if not speaking:
-                        pre_buffer.append(frame_bytes)
-                        if is_speech:
-                            speaking = True
-                            silence_count = 0
-                            # Flush pre-buffer into speech
-                            speech_frames.extend(pre_buffer)
-                            pre_buffer.clear()
-                    else:
-                        speech_frames.append(frame_bytes)
-                        if is_speech:
-                            silence_count = 0
+            if self._ptt_mode:
+                # PTT: wait for button press, then record while held
+                while self._running and not self._paused and not self._ptt_active.is_set():
+                    time.sleep(0.02)
+                if not self._running or self._paused:
+                    continue
+                speech_frames = []
+                self._emit_recording_state(True)
+                try:
+                    while self._running and self._ptt_active.is_set() and self._stream is not None:
+                        data, overflowed = self._stream.read(SAMPLES_PER_FRAME)
+                        if overflowed:
+                            log.debug("Input overflow — dropped samples")
+                        speech_frames.append(data.tobytes())
+                except (RuntimeError, OSError) as exc:
+                    log.warning("Stream read error: %s", exc)
+                    self._stop_stream()
+                    speech_frames = []
+                finally:
+                    self._emit_recording_state(False)
+                if not speech_frames or not self._running:
+                    continue
+            else:
+                # VAD: detect speech onset, collect until silence
+                speech_frames = []
+                silence_count = 0
+                speaking = False
+                pre_buffer.clear()
+                try:
+                    while self._running and not self._paused and self._stream is not None:
+                        data, overflowed = self._stream.read(SAMPLES_PER_FRAME)
+                        if overflowed:
+                            log.debug("Input overflow — dropped samples")
+                        frame_bytes = data.tobytes()
+                        is_speech = self._vad.is_speech(frame_bytes, SAMPLE_RATE)
+                        if not speaking:
+                            pre_buffer.append(frame_bytes)
+                            if is_speech:
+                                speaking = True
+                                silence_count = 0
+                                speech_frames.extend(pre_buffer)
+                                pre_buffer.clear()
                         else:
-                            silence_count += 1
-                            if silence_count >= silence_frames_needed:
-                                break  # End of utterance
-            except (RuntimeError, OSError) as exc:
-                log.warning("Stream read error: %s", exc)
-                self._stop_stream()
-                continue
-
-            if not speech_frames or not self._running:
-                continue
+                            speech_frames.append(frame_bytes)
+                            if is_speech:
+                                silence_count = 0
+                            else:
+                                silence_count += 1
+                                if silence_count >= silence_frames_needed:
+                                    break  # End of utterance
+                except (RuntimeError, OSError) as exc:
+                    log.warning("Stream read error: %s", exc)
+                    self._stop_stream()
+                    continue
+                if not speech_frames or not self._running:
+                    continue
 
             # --- Convert to float32 for whisper ---
             raw = b"".join(speech_frames)
             pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
+            # (C) Discard clips too short — VAD mode only; PTT user decides duration
+            if not self._ptt_mode:
+                duration = len(pcm) / SAMPLE_RATE
+                if duration < self._min_speech_seconds:
+                    log.debug("Utterance too short (%.2fs) — discarded", duration)
+                    continue
             # --- Transcribe ---
             self._emit_status("processing")
             text = self._transcribe(pcm)
@@ -290,6 +335,10 @@ class VoiceInput:
 
     def _emit_text(self, text: str) -> None:
         if not text or not text.strip():
+            return
+        # (A) Discard likely hallucinations / noise transcriptions
+        if len(text.strip().split()) < self._min_words:
+            log.debug("Utterance too short (%r) — discarded", text)
             return
         if self._callback is not None:
             self._callback(text.strip())

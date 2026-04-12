@@ -170,14 +170,57 @@ class TestVADStateMachine:
         mock_vad_mod.Vad.assert_called_once_with(3)
 
     def test_silence_duration_default(self):
-        """Default post-speech silence should be 0.5s."""
+        """Default post-speech silence should be 1.2s (increased for fewer false triggers)."""
         vi = VoiceInput()
-        assert vi._post_speech_silence == 0.5
+        assert vi._post_speech_silence == 1.2
+
+    def test_min_speech_seconds_default(self):
+        """Utterances shorter than 1.0s should be discarded."""
+        vi = VoiceInput()
+        assert vi._min_speech_seconds == 1.0
+
+    def test_min_words_default(self):
+        """Transcriptions with fewer than 3 words should be discarded."""
+        vi = VoiceInput()
+        assert vi._min_words == 3
 
     def test_pre_buffer_duration_default(self):
         """Default pre-recording buffer should be 0.3s."""
         vi = VoiceInput()
         assert vi._pre_buffer_seconds == 0.3
+
+    def test_ptt_mode_default_off(self):
+        vi = VoiceInput()
+        assert vi._ptt_mode is False
+
+    def test_set_ptt_mode_true(self):
+        vi = VoiceInput()
+        vi.set_ptt_mode(True)
+        assert vi._ptt_mode is True
+
+    def test_set_ptt_mode_false_clears_active(self):
+        vi = VoiceInput()
+        vi._ptt_active.set()
+        vi.set_ptt_mode(False)
+        assert not vi._ptt_active.is_set()
+
+    def test_ptt_press_sets_event_when_ptt_on(self):
+        vi = VoiceInput()
+        vi.set_ptt_mode(True)
+        vi.ptt_press()
+        assert vi._ptt_active.is_set()
+
+    def test_ptt_press_no_op_when_ptt_off(self):
+        vi = VoiceInput()
+        vi.ptt_press()  # PTT mode is off — should not set event
+        assert not vi._ptt_active.is_set()
+
+    def test_ptt_release_clears_event(self):
+        vi = VoiceInput()
+        vi.set_ptt_mode(True)
+        vi.ptt_press()
+        vi.ptt_release()
+        assert not vi._ptt_active.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +308,16 @@ class TestCallbackSafety:
         vi = VoiceInput()
         received = []
         vi.on_text(lambda t: received.append(t))
+        vi._emit_text("hello world test")
+        assert received == ["hello world test"]
+
+    def test_callback_not_invoked_for_short_utterance(self):
+        """Transcriptions with fewer than min_words words are discarded."""
+        vi = VoiceInput()
+        received = []
+        vi.on_text(lambda t: received.append(t))
         vi._emit_text("hello")
-        assert received == ["hello"]
+        assert received == []
 
     def test_callback_not_invoked_for_empty_text(self):
         vi = VoiceInput()
